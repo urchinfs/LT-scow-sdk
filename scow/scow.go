@@ -1,16 +1,15 @@
 package scow
 
 import (
-	"LT-scow-sdk/types"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/donnie4w/go-logger/logger"
 	"github.com/go-resty/resty/v2"
+	"github.com/urchinfs/LT-scow-sdk/types"
 	urchinutil "github.com/urchinfs/urchin_util/redis"
 	"io"
-	"log"
 	"net/http"
 	"path"
 	"strconv"
@@ -22,6 +21,8 @@ const (
 	DefaultClusterId = "dev-k8s"
 	DefaultRootPath  = "/data/home/xiaoyan"
 )
+
+var ClusterId, RootPath string
 
 type Client interface {
 	StorageVolExists(ctx context.Context, storageVolName string) (bool, error)
@@ -166,12 +167,42 @@ func parseBody(ctx context.Context, reply *Reply, body interface{}) error {
 }
 
 func (c *client) completePath(storageVolName string, elem ...string) string {
-	elems := append([]string{DefaultRootPath, storageVolName}, elem...)
+	if RootPath == "" {
+		rootPathKey := c.redisStorage.MakeStorageKey([]string{}, types.StoragePrefixScowRootPath)
+		value, err := c.redisStorage.Get(rootPathKey)
+		if err != nil || string(value) == "" {
+			rootPath, err := c.getHomePath(context.Background())
+			if err != nil {
+				RootPath = DefaultRootPath
+			} else {
+				RootPath = rootPath
+			}
+		} else {
+			RootPath = string(value)
+		}
+	}
+
+	elems := append([]string{RootPath, storageVolName}, elem...)
 	return path.Join(elems...)
 }
 
 func (c *client) clusterId() string {
-	return DefaultClusterId
+	if ClusterId == "" {
+		clusterIdKey := c.redisStorage.MakeStorageKey([]string{}, types.StoragePrefixScowClusterId)
+		value, err := c.redisStorage.Get(clusterIdKey)
+		if err != nil || string(value) == "" {
+			id, err := c.getClusterId(context.Background())
+			if err != nil {
+				ClusterId = DefaultClusterId
+			} else {
+				ClusterId = id
+			}
+		} else {
+			ClusterId = string(value)
+		}
+	}
+
+	return ClusterId
 }
 
 func (c *client) needRetry(r *ErrorReply) bool {
@@ -236,7 +267,6 @@ func (c *client) sendHttpRequest(ctx context.Context, httpMethod, httpPath strin
 					return err
 				}
 
-				log.Printf("*****************111*********************")
 				time.Sleep(time.Second * 2)
 				continue
 			}
@@ -246,7 +276,6 @@ func (c *client) sendHttpRequest(ctx context.Context, httpMethod, httpPath strin
 			if err == nil {
 				if c.needRetry(r) {
 					time.Sleep(time.Second * 2)
-					log.Printf("******************2222********************")
 					continue
 				}
 			}
@@ -633,7 +662,7 @@ func (c *client) ListFiles(ctx context.Context, storageVolName, prefix, marker s
 	var objects []*FileInfo
 	for {
 		resp := &FileListReply{}
-		reqPath := fmt.Sprintf("/v1/ai/api/file/listDirectory/clusterId=%s&path=%s", c.clusterId(), c.completePath(storageVolName, prefix))
+		reqPath := fmt.Sprintf("/v1/ai/api/file/listDirectory/ClusterId=%s&path=%s", c.clusterId(), c.completePath(storageVolName, prefix))
 		err := c.sendHttpRequest(ctx, types.HttpMethodGet, reqPath, "", resp)
 		if err != nil {
 			return nil, err
@@ -829,4 +858,56 @@ func (c *client) StatFolder(ctx context.Context, storageVolName, folderName stri
 
 func (c *client) PostTransfer(ctx context.Context, storageVolName, fileName string, isSuccess bool) error {
 	return nil
+}
+
+func (c *client) getHomePath(ctx context.Context) (string, error) {
+	err := c.refreshToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	type homePathResp struct {
+		Data struct {
+			Path string `json:"path"`
+		} `json:"data"`
+	}
+	reqPath := fmt.Sprintf("/v1/ai/api/file/homeDir?clusterId=%s", c.clusterId())
+	resp := &homePathResp{}
+	err = c.sendHttpRequest(ctx, types.HttpMethodGet, reqPath, "", resp)
+	if err != nil {
+		return "", err
+	}
+
+	rootPathKey := c.redisStorage.MakeStorageKey([]string{}, types.StoragePrefixScowRootPath)
+	_ = c.redisStorage.SetWithTimeout(rootPathKey, []byte(resp.Data.Path), types.DefaultTokenExpireTime)
+
+	return resp.Data.Path, nil
+}
+
+func (c *client) getClusterId(ctx context.Context) (string, error) {
+	err := c.refreshToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	type configResp struct {
+		Data struct {
+			ClusterSortedIdList []string `json:"CLUSTER_SORTED_ID_LIST"`
+		} `json:"data"`
+	}
+	reqPath := fmt.Sprintf("/v1/ai/api/config")
+	resp := &configResp{}
+	err = c.sendHttpRequest(ctx, types.HttpMethodGet, reqPath, "", resp)
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Data.ClusterSortedIdList) <= 0 {
+		return "", types.ErrorNotExists
+	}
+
+	clusterIdKey := c.redisStorage.MakeStorageKey([]string{}, types.StoragePrefixScowClusterId)
+	id := resp.Data.ClusterSortedIdList[0]
+	_ = c.redisStorage.SetWithTimeout(clusterIdKey, []byte(id), types.DefaultTokenExpireTime)
+
+	return id, nil
 }

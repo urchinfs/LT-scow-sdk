@@ -25,9 +25,10 @@ const (
 )
 
 const (
-	StoragePrefix           = "urchin"
-	StoragePrefixScowToken  = "urchin:storage:token:LT-scow"
-	StoragePrefixScowConfig = "urchin:storage:config:LT-scow"
+	StoragePrefix              = "urchin"
+	StoragePrefixScowToken     = "urchin:storage:LT-scow:token"
+	StoragePrefixScowClusterId = "urchin:storage:LT-scow:clusterId"
+	StoragePrefixScowRootPath  = "urchin:storage:LT-scow:rootPath "
 )
 
 const (

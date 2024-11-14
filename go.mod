@@ -1,4 +1,4 @@
-module LT-scow-sdk
+module github.com/urchinfs/LT-scow-sdk
 
 go 1.22.4
 
