@@ -21,7 +21,6 @@ import "time"
 const (
 	AuthHeader             = "Authorization"
 	DefaultTokenExpireTime = time.Hour * 6
-	//ScowTokenUrl           = "http://100.127.0.124:30090"
 )
 
 const (
@@ -40,6 +39,12 @@ const (
 const (
 	StorageListTypeFile = "FILE"
 	StorageListTypeDir  = "DIR"
+)
+
+const (
+	ChunkSize        = 200 * 1024 * 1024
+	ReadBufferSize   = 32 * 1024
+	ChunkUploadLimit = 1024 * 1024 * 1024
 )
 
 const (
