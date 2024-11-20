@@ -1,12 +1,16 @@
 package scow
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/donnie4w/go-logger/logger"
 	"github.com/go-resty/resty/v2"
+	"github.com/google/uuid"
 	"github.com/urchinfs/LT-scow-sdk/types"
 	urchinutil "github.com/urchinfs/urchin_util/redis"
 	"io"
@@ -22,7 +26,16 @@ const (
 	DefaultRootPath  = "/data/home/xiaoyan"
 )
 
-var ClusterId, RootPath string
+var (
+	RootPath  string
+	ClusterId string
+)
+
+type existResp struct {
+	Data struct {
+		Exists bool `json:"exists"`
+	} `json:"data"`
+}
 
 type Client interface {
 	StorageVolExists(ctx context.Context, storageVolName string) (bool, error)
@@ -31,13 +44,13 @@ type Client interface {
 
 	ListStorageVols(ctx context.Context) ([]StorageVolInfo, error)
 
-	StatFile(ctx context.Context, storageVolName, fileName string) (FileInfo, error)
+	StatFile(ctx context.Context, storageVolName, filePath string) (FileInfo, error)
 
-	UploadFile(ctx context.Context, storageVolName, fileName, digest string, reader io.Reader) error
+	UploadFile(ctx context.Context, storageVolName, filePath, digest string, totalLength int64, reader io.Reader) error
 
-	DownloadFile(ctx context.Context, storageVolName, fileName string) (io.ReadCloser, error)
+	DownloadFile(ctx context.Context, storageVolName, filePath string) (io.ReadCloser, error)
 
-	RemoveFile(ctx context.Context, storageVolName, fileName string) error
+	RemoveFile(ctx context.Context, storageVolName, filePath string) error
 
 	RemoveFiles(ctx context.Context, storageVolName string, objects []*FileInfo) error
 
@@ -47,17 +60,17 @@ type Client interface {
 
 	ListDirFiles(ctx context.Context, storageVolName, prefix string) ([]*FileInfo, error)
 
-	IsFileExist(ctx context.Context, storageVolName, fileName string) (bool, error)
+	IsFileExist(ctx context.Context, storageVolName, filePath string) (bool, error)
 
 	IsStorageVolExist(ctx context.Context, storageVolName string) (bool, error)
 
-	GetDownloadLink(ctx context.Context, storageVolName, fileName string, expire time.Duration) (string, error)
+	GetDownloadLink(ctx context.Context, storageVolName, filePath string, expire time.Duration) (string, error)
 
-	CreateDir(ctx context.Context, storageVolName, folderName string) error
+	CreateFolder(ctx context.Context, storageVolName, folderName string) error
 
 	StatFolder(ctx context.Context, storageVolName, folderName string) (*FileInfo, bool, error)
 
-	PostTransfer(ctx context.Context, storageVolName, fileName string, isSuccess bool) error
+	PostTransfer(ctx context.Context, storageVolName, filePath string, isSuccess bool) error
 }
 
 type client struct {
@@ -158,7 +171,7 @@ func parseBody(ctx context.Context, reply *Reply, body interface{}) error {
 	if body != nil {
 		err := json.Unmarshal(reply.RespBody, body)
 		if err != nil {
-			logger.Error(ctx, "parseBody json Unmarshal failed, error:%v", err)
+			logger.Errorf("parseBody json Unmarshal failed, error:%v", err)
 			return types.ErrorJsonUnmarshalFailed
 		}
 	}
@@ -475,11 +488,6 @@ func (c *client) statType(ctx context.Context, storageVolName, statKey string, i
 		return FileInfo{}, err
 	}
 
-	type existResp struct {
-		Data struct {
-			Exists bool `json:"exists"`
-		} `json:"data"`
-	}
 	reqPath := fmt.Sprintf("/v1/ai/api/file/checkExist?clusterId=%s&path=%s", c.clusterId(), c.completePath(storageVolName, statKey))
 	fileExist := &existResp{}
 	err = c.sendHttpRequest(ctx, types.HttpMethodGet, reqPath, "", fileExist)
@@ -518,26 +526,29 @@ func (c *client) statType(ctx context.Context, storageVolName, statKey string, i
 	}, nil
 }
 
-func (c *client) StatFile(ctx context.Context, storageVolName, fileName string) (FileInfo, error) {
-	return c.statType(ctx, storageVolName, fileName, false)
+func (c *client) StatFile(ctx context.Context, storageVolName, filePath string) (FileInfo, error) {
+	return c.statType(ctx, storageVolName, filePath, false)
 }
 
-func (c *client) UploadFile(ctx context.Context, storageVolName, fileName, digest string, reader io.Reader) error {
+func (c *client) UploadFile(ctx context.Context, storageVolName, filePath, digest string, totalLength int64, reader io.Reader) error {
+	if totalLength > types.ChunkUploadLimit {
+		return c.uploadBigFile(ctx, storageVolName, filePath, digest, totalLength, reader)
+	}
+
+	logger.Infof("UploadFile small file, filePath:%v", path.Join(storageVolName, filePath))
 	err := c.refreshToken(ctx)
 	if err != nil {
 		return err
 	}
 
-	reqPath := fmt.Sprintf("/v1/ai/api/files/upload?clusterId=%s&path=%s", c.clusterId(), c.completePath(storageVolName, fileName))
+	reqPath := fmt.Sprintf("/v1/ai/api/files/upload?clusterId=%s&path=%s", c.clusterId(), c.completePath(storageVolName, filePath))
 	r := &ErrorReply{}
 	response, err := c.httpClient.R().
 		SetHeader("Content-Type", "application/octet-stream").
 		SetHeader(types.AuthHeader, c.token).
-		SetFileReader("file", fileName, reader).
-		//SetBody(reader).
+		SetFileReader("file", filePath, reader).
 		SetResult(r).
 		Post(c.endpoint + reqPath)
-
 	if err != nil {
 		return err
 	}
@@ -612,7 +623,7 @@ func (c *client) deleteOp(ctx context.Context, storageVolName, deleteKey string,
 	}
 	jsonData, err := json.Marshal(&req)
 	if err != nil {
-		logger.Error(ctx, "parseBody json Marshal failed, error:%v", err)
+		logger.Errorf("parseBody json Marshal failed, error:%v", err)
 		return types.ErrorJsonMarshalFailed
 	}
 
@@ -626,8 +637,8 @@ func (c *client) deleteOp(ctx context.Context, storageVolName, deleteKey string,
 	return nil
 }
 
-func (c *client) RemoveFile(ctx context.Context, storageVolName, fileName string) error {
-	return c.deleteOp(ctx, storageVolName, fileName, false)
+func (c *client) RemoveFile(ctx context.Context, storageVolName, filePath string) error {
+	return c.deleteOp(ctx, storageVolName, filePath, false)
 }
 
 func (c *client) RemoveFiles(ctx context.Context, storageVolName string, objects []*FileInfo) error {
@@ -782,7 +793,7 @@ func (c *client) ListDirFiles(ctx context.Context, storageVolName, prefix string
 	return resp, nil
 }
 
-func (c *client) IsFileExist(ctx context.Context, storageVolName, fileName string) (bool, error) {
+func (c *client) IsFileExist(ctx context.Context, storageVolName, filePath string) (bool, error) {
 	err := c.refreshToken(ctx)
 	if err != nil {
 		return false, err
@@ -793,7 +804,7 @@ func (c *client) IsFileExist(ctx context.Context, storageVolName, fileName strin
 			Exists bool `json:"exists"`
 		} `json:"data"`
 	}
-	reqPath := fmt.Sprintf("/v1/ai/api/file/checkExist?clusterId=%s&path=%s", c.clusterId(), c.completePath(storageVolName, fileName))
+	reqPath := fmt.Sprintf("/v1/ai/api/file/checkExist?clusterId=%s&path=%s", c.clusterId(), c.completePath(storageVolName, filePath))
 	fileExist := &existResp{}
 	err = c.sendHttpRequest(ctx, types.HttpMethodGet, reqPath, "", fileExist)
 	if err != nil {
@@ -807,19 +818,26 @@ func (c *client) IsStorageVolExist(ctx context.Context, storageVolName string) (
 	return c.StorageVolExists(ctx, storageVolName)
 }
 
-func (c *client) GetDownloadLink(ctx context.Context, storageVolName, fileName string, expire time.Duration) (string, error) {
+func (c *client) GetDownloadLink(ctx context.Context, storageVolName, filePath string, expire time.Duration) (string, error) {
 	if err := c.refreshToken(ctx); err != nil {
 		return "", err
 	}
 
 	signedUrl := fmt.Sprintf("%s/v1/ai/api/file/downloadWithToken?clusterId=%s&path=%s&download=true&token=%s",
-		c.endpoint, c.clusterId(), c.completePath(storageVolName, fileName), c.token)
+		c.endpoint, c.clusterId(), c.completePath(storageVolName, filePath), c.token)
 	return signedUrl, nil
 }
 
-func (c *client) CreateDir(ctx context.Context, storageVolName, folderName string) error {
+func (c *client) CreateFolder(ctx context.Context, storageVolName, folderName string) error {
 	if err := c.refreshToken(ctx); err != nil {
 		return err
+	}
+
+	reqPath := fmt.Sprintf("/v1/ai/api/file/checkExist?clusterId=%s&path=%s", c.clusterId(), c.completePath(storageVolName, folderName))
+	fileExist := &existResp{}
+	err := c.sendHttpRequest(ctx, types.HttpMethodGet, reqPath, "", fileExist)
+	if err == nil && fileExist.Data.Exists {
+		return nil
 	}
 
 	type createReq struct {
@@ -833,14 +851,17 @@ func (c *client) CreateDir(ctx context.Context, storageVolName, folderName strin
 	}
 	jsonData, err := json.Marshal(&req)
 	if err != nil {
-		logger.Error(ctx, "parseBody json Marshal failed, error:%v", err)
+		logger.Errorf("parseBody json Marshal failed, error:%v", err)
 		return types.ErrorJsonMarshalFailed
 	}
 
-	reqPath := fmt.Sprintf("/v1/ai/api/file/mkdir")
+	reqPath = fmt.Sprintf("/v1/ai/api/file/mkdir")
 	r := &Reply{}
 	err = c.sendHttpRequest(ctx, types.HttpMethodPost, reqPath, string(jsonData), r)
 	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			return nil
+		}
 		return err
 	}
 
@@ -856,7 +877,7 @@ func (c *client) StatFolder(ctx context.Context, storageVolName, folderName stri
 	return &statInfo, true, nil
 }
 
-func (c *client) PostTransfer(ctx context.Context, storageVolName, fileName string, isSuccess bool) error {
+func (c *client) PostTransfer(ctx context.Context, storageVolName, filePath string, isSuccess bool) error {
 	return nil
 }
 
@@ -910,4 +931,115 @@ func (c *client) getClusterId(ctx context.Context) (string, error) {
 	_ = c.redisStorage.SetWithTimeout(clusterIdKey, []byte(id), types.DefaultTokenExpireTime)
 
 	return id, nil
+}
+
+func (c *client) uploadBigFile(ctx context.Context, storageVolName, filePath, digest string, totalLength int64, reader io.Reader) error {
+	logger.Infof("uploadBigFile start, filePath:%s, digest:%s, totalLength:%d", path.Join(storageVolName, filePath), digest, totalLength)
+	err := c.refreshToken(ctx)
+	if err != nil {
+		return err
+	}
+
+	if digest == "" {
+		uid := uuid.New().String()
+		hash := md5.New()
+		_, err := io.WriteString(hash, fmt.Sprintf("%s:%s:%d", uid, storageVolName+filePath, totalLength))
+		if err != nil {
+			return err
+		}
+
+		hashBytes := hash.Sum(nil)
+		digest = hex.EncodeToString(hashBytes)
+	}
+
+	fileName := path.Base(filePath)
+	folderPath := path.Dir(filePath)
+	pieceIdx := int64(0)
+	reqPath := fmt.Sprintf("/v1/ai/api/files/uploadChunks?clusterId=%s&path=%s", c.clusterId(), c.completePath(storageVolName, folderPath))
+	for {
+		pieceIdx++
+		rc := 0
+		dataBuffer := make([]byte, 0)
+		pipeBuffer := make([]byte, types.ReadBufferSize)
+		for {
+			n, err := reader.Read(pipeBuffer)
+			if err != nil && err != io.EOF {
+				logger.Errorf("read failed, error:%v", err)
+				return err
+			}
+			if n == 0 {
+				break
+			}
+
+			dataBuffer = append(dataBuffer, pipeBuffer[:n]...)
+			rc += n
+			if n < types.ReadBufferSize || rc >= types.ChunkSize {
+				break
+			}
+		}
+		if rc == 0 {
+			break
+		}
+
+		r := &ErrorReply{}
+		response, err := c.httpClient.R().
+			SetHeader("Content-Type", "application/octet-stream").
+			SetHeader(types.AuthHeader, c.token).
+			SetFileReader("file", fileName, bytes.NewBuffer(dataBuffer[:rc])).
+			SetMultipartFormData(map[string]string{"fileMd5Name": fmt.Sprintf("%s_%d.%s", digest, pieceIdx, fileName)}).
+			SetResult(r).
+			Post(c.endpoint + reqPath)
+		if err != nil {
+			logger.Errorf("UploadFile Post Error: %v, Body:%v", err, response.StatusCode())
+			return err
+		}
+		if !response.IsSuccess() {
+			r := &ErrorReply{}
+			err = json.Unmarshal(response.Body(), r)
+			if err != nil {
+				logger.Errorf("UploadFile json.Unmarshal Error: %v, Body:%v", err, response.StatusCode())
+				return types.ErrorJsonUnmarshalFailed
+			}
+
+			return errors.New("Http Code:" + response.Status() + ", Code:" + r.Code + ", Msg:" + r.Message)
+		}
+
+		if r.Message != "success" {
+			return errors.New("Code:" + r.Code + ", Msg:" + r.Message)
+		}
+
+		if rc < types.ChunkSize {
+			break
+		}
+	}
+
+	//- merge file chunks
+	type mergeChunkReq struct {
+		ClusterId string `json:"clusterId"`
+		Path      string `json:"path"`
+		Md5       string `json:"md5"`
+		FileName  string `json:"fileName"`
+	}
+
+	req := mergeChunkReq{
+		ClusterId: c.clusterId(),
+		Path:      c.completePath(storageVolName, folderPath),
+		Md5:       digest,
+		FileName:  fileName,
+	}
+	jsonData, err := json.Marshal(&req)
+	if err != nil {
+		logger.Errorf("parseBody json Marshal failed, error:%v", err)
+		return types.ErrorJsonMarshalFailed
+	}
+
+	reqPath = fmt.Sprintf("/v1/ai/api/file/mergeChunks")
+	r := &Reply{}
+	err = c.sendHttpRequest(ctx, types.HttpMethodPost, reqPath, string(jsonData), r)
+	if err != nil {
+		logger.Errorf("mergeChunks err:%v", err)
+		return err
+	}
+
+	return nil
 }
