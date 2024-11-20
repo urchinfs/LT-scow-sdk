@@ -1,10 +1,11 @@
 module github.com/urchinfs/LT-scow-sdk
 
-go 1.22.4
+go 1.19
 
 require (
 	github.com/donnie4w/go-logger v0.27.0
 	github.com/go-resty/resty/v2 v2.15.3
+	github.com/google/uuid v1.6.0
 	github.com/urchinfs/urchin_util v0.0.2
 )
 
