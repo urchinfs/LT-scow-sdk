@@ -1008,9 +1008,10 @@ func (c *client) uploadBigFile(ctx context.Context, storageVolName, filePath, di
 			return errors.New("Code:" + r.Code + ", Msg:" + r.Message)
 		}
 
-		if rc < types.ChunkSize {
-			break
-		}
+		// -fix bug
+		//if rc < types.ChunkSize {
+		//	break
+		//}
 	}
 
 	//- merge file chunks
