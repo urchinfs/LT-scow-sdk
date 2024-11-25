@@ -588,6 +588,10 @@ func (c *client) DownloadFile(ctx context.Context, storageVolName, filePath stri
 	}
 
 	if !response.IsSuccess() {
+		if response.StatusCode() != http.StatusOK {
+			return nil, fmt.Errorf("http Code:%v, Status:%v", response.StatusCode(), response.Status())
+		}
+
 		r := &ErrorReply{}
 		err = json.Unmarshal(response.Body(), r)
 		if err != nil {
@@ -738,8 +742,15 @@ func (c *client) listDirObjs(ctx context.Context, storageVolName, dirPath string
 				timeObj = time.Time{}
 			}
 
+			key := path.Join(dirPath, item.Name)
+			if strings.ToUpper(item.Type) == types.StorageListTypeDir {
+				if !strings.HasSuffix(key, "/") {
+					key += "/"
+				}
+			}
+
 			objects = append(objects, &FileInfo{
-				Key:          path.Join(dirPath, item.Name),
+				Key:          key,
 				Size:         item.Size,
 				LastModified: timeObj,
 			})
@@ -778,17 +789,13 @@ func (c *client) ListDirFiles(ctx context.Context, storageVolName, prefix string
 	}
 
 	if prefix != "" {
+		if !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
 		resp = append(resp, &FileInfo{
 			Key: prefix,
 		})
 	}
-
-	//if !strings.HasSuffix(prefix, "/") {
-	//	prefix += "/"
-	//}
-	//resp = append(resp, &FileInfo{
-	//	Key: prefix,
-	//})
 
 	return resp, nil
 }
@@ -1008,9 +1015,10 @@ func (c *client) uploadBigFile(ctx context.Context, storageVolName, filePath, di
 			return errors.New("Code:" + r.Code + ", Msg:" + r.Message)
 		}
 
-		if rc < types.ChunkSize {
-			break
-		}
+		// -fix bug
+		//if rc < types.ChunkSize {
+		//	break
+		//}
 	}
 
 	//- merge file chunks
